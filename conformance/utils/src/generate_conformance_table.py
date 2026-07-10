@@ -1480,6 +1480,10 @@ def _parser_label_markdown(
 # Families with bespoke paths (harmony token-id/text, deepseek_v4 DSML note) keep their
 # dedicated branches below; new standard families belong here, not in new if-branches.
 _V2_STREAM_PARSER_CELLS: dict[str, tuple[str, str, str]] = {
+    "gemma4": ("Gemma4ToolStreamParser text path", "gemma4.rs", "Gemma"),
+    "glm47": ("Glm47ToolStreamParser text path", "glm47.rs", "GLM XML"),
+    "kimi_k2": ("KimiK2ToolStreamParser text path", "kimi_k2.rs", "Kimi XML"),
+    "minimax_m2": ("MiniMaxM2ToolStreamParser text path", "minimax_m2.rs", "MiniMax XML"),
     "qwen3_coder": ("Qwen3CoderToolStreamParser text path", "qwen3_coder.rs", "Qwen XML"),
 }
 
