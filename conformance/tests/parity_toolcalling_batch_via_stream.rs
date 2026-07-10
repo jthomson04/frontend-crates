@@ -13,7 +13,7 @@ mod common;
 use common::{collect_yaml, fixture_name};
 
 use dynamo_parsers_v2::{
-    HarmonyToolStreamParser, ToolCallDelta, ToolParseResult, assemble_tool_calls,
+    HarmonyToolStreamParser, Tool, ToolCallDelta, ToolParseResult, assemble_tool_calls,
     create_tool_parser_for_family,
 };
 use serde::Deserialize;
@@ -33,6 +33,11 @@ struct Case {
     model_text: Option<String>,
     #[serde(default)]
     expected: Option<Expected>,
+    // The schema-dependent parsers (glm47, kimi_k2, qwen3_coder, minimax_m2, …)
+    // need the tool schema to coerce argument types the way the v1 batch parser
+    // did; the batch fixture carries it per case.
+    #[serde(default)]
+    tools: Vec<Tool>,
 }
 
 #[derive(Deserialize)]
@@ -77,16 +82,42 @@ fn toolcalling_batch_via_stream_parity() {
 
     // Batch samples where the streaming parser deliberately differs from the
     // strict batch parser. Removing an entry asserts that stream and batch now
-    // agree on that sample.
+    // agree on that sample. This compares BOTH calls and normal_text; the HTML
+    // batch-on-stream tab compares calls only, so the `normal_text`-only entries
+    // below still render green there.
     //
     // The DSv4 stream parser now buffers each invoke until `</｜DSML｜invoke>` and
     // drops a call truncated before its close (v1 parity), so the former 5.c /
-    // 5.e truncation divergences are gone. The remaining entry:
-    //   5.g: bare invoke after prose — the stream parser recovers it while the
-    //        strict batch parser drops it (pre-existing recovery divergence,
-    //        unrelated to truncation).
-    let known_divergences: std::collections::BTreeSet<&str> =
-        ["deepseek_v4:TOOLCALLING.batch.5.g"].into_iter().collect();
+    // 5.e truncation divergences are gone. Remaining entries:
+    //   deepseek_v4 5.g: bare invoke after prose — the stream parser recovers it
+    //        while the strict batch parser drops it (recovery divergence).
+    //   gemma4 / kimi_k2 / glm47 / minimax_m2 / qwen3_coder (calls IDENTICAL,
+    //        normal_text only): the streaming parser faithfully emits the model's
+    //        text AROUND the tool calls VERBATIM, while the v1 batch parser trims
+    //        surrounding whitespace that would otherwise be the entire (or a
+    //        trailing) normal_text. The calls always match; only whitespace-only
+    //        surrounding text differs. e.g. gemma4 8.b stream "  Let me know if you
+    //        need more." vs batch ""; the XML families' 2.a/2.b/2.d/10 (parallel
+    //        calls separated only by a newline) stream "\n" vs batch ""; qwen3 5.d/
+    //        5.e keep one extra trailing "\n" the batch parser trims. The streaming
+    //        peers stream this surrounding text the same way, and the HTML
+    //        batch-on-stream tab compares calls only, so these render green there.
+    let known_divergences: std::collections::BTreeSet<&str> = [
+        "deepseek_v4:TOOLCALLING.batch.5.g",
+        "gemma4:TOOLCALLING.batch.5.g",
+        "gemma4:TOOLCALLING.batch.8.a",
+        "gemma4:TOOLCALLING.batch.8.b",
+        "gemma4:TOOLCALLING.batch.8.d",
+        "kimi_k2:TOOLCALLING.batch.5.g",
+        "minimax_m2:TOOLCALLING.batch.2.b",
+        "qwen3_coder:TOOLCALLING.batch.2.a",
+        "qwen3_coder:TOOLCALLING.batch.2.d",
+        "qwen3_coder:TOOLCALLING.batch.5.d",
+        "qwen3_coder:TOOLCALLING.batch.5.e",
+        "qwen3_coder:TOOLCALLING.batch.10",
+    ]
+    .into_iter()
+    .collect();
 
     let mut total = 0usize;
     let mut consistent = 0usize;
@@ -103,7 +134,15 @@ fn toolcalling_batch_via_stream_parity() {
                 continue;
             }
         };
-        if !(fx.family == "harmony" || fx.family == "deepseek_v4") || fx.mode != "batch" {
+        if fx.mode != "batch" {
+            continue;
+        }
+        // Data-driven coverage (reuse the family registry, no hardcoded list):
+        // harmony runs the token/text Harmony path; every other family is
+        // exercised iff `create_tool_parser_for_family` can build a v2 parser for
+        // it. Registering a new family there auto-adds it to this stream-on-batch
+        // consistency check.
+        if fx.family != "harmony" && create_tool_parser_for_family(&fx.family, &[]).is_err() {
             continue;
         }
         let rel = path.strip_prefix(&inputs_root).unwrap();
@@ -126,7 +165,7 @@ fn toolcalling_batch_via_stream_parity() {
             };
             total += 1;
 
-            let got = parse_stream_result(&fx.family, text).unwrap();
+            let got = parse_stream_result(&fx.family, text, &case.tools).unwrap();
             let want = EngineResult {
                 calls: expected
                     .dynamo
@@ -190,6 +229,7 @@ struct EngineResult {
 fn parse_stream_result(
     family: &str,
     text: &str,
+    tools: &[Tool],
 ) -> Result<EngineResult, Box<dyn std::error::Error>> {
     if family == "harmony" {
         let mut parser = HarmonyToolStreamParser::new()?;
@@ -209,7 +249,7 @@ fn parse_stream_result(
         });
     }
 
-    let mut parser = create_tool_parser_for_family(family, &[])?;
+    let mut parser = create_tool_parser_for_family(family, tools)?;
     let mut result = parser.push(text)?;
     result.append(parser.finish()?);
     Ok(EngineResult {

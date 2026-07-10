@@ -364,12 +364,15 @@ fn toolcalling_stream_parity() {
         };
         let rel = path.strip_prefix(&inputs_root).unwrap();
         merge_dynamo(&mut fx, &dyn_dir, rel);
-        if !(fx.family == "harmony"
-            || fx.family == "harmony_text"
-            || fx.family == "deepseek_v4"
-            || fx.family == "qwen3_coder")
-            || !matches!(fx.mode.as_deref(), Some("stream" | "streamv2"))
-        {
+        if !matches!(fx.mode.as_deref(), Some("stream" | "streamv2")) {
+            continue;
+        }
+        // Data-driven coverage (reuse the family registry, no hardcoded list):
+        // harmony/harmony_text run the token-native path below; every other
+        // family is exercised iff `create_tool_parser_for_family` can build a v2
+        // parser for it. Registering a new family there auto-adds it here.
+        let is_harmony = fx.family == "harmony" || fx.family == "harmony_text";
+        if !is_harmony && create_tool_parser_for_family(&fx.family, &[]).is_err() {
             continue;
         }
         eprintln!("fixture {}", fixture_name(path));

@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use dynamo_parsers_v2::{
-    HarmonyToolStreamParser, ToolCallDelta, ToolParseResult, ToolParserInput, assemble_tool_calls,
-    create_tool_parser_for_family,
+    HarmonyToolStreamParser, Tool, ToolCallDelta, ToolParseResult, ToolParserInput,
+    assemble_tool_calls, create_tool_parser_for_family,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,6 +36,10 @@ struct Fixture {
 struct Case {
     #[serde(default)]
     model_text: Option<String>,
+    // Schema-dependent parsers (glm47, kimi_k2, qwen3_coder, minimax_m2, …) need
+    // the tool schema to coerce argument types the way the v1 batch parser did.
+    #[serde(default)]
+    tools: Vec<Tool>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -103,7 +107,7 @@ fn record_family(
             out.insert(
                 cid.clone(),
                 CaseOut {
-                    result: parse_result(family, text)?,
+                    result: parse_result(family, text, &case.tools)?,
                 },
             );
         }
@@ -111,7 +115,7 @@ fn record_family(
     Ok(out)
 }
 
-fn parse_result(family: &str, text: &str) -> anyhow::Result<CaseOutInner> {
+fn parse_result(family: &str, text: &str, tools: &[Tool]) -> anyhow::Result<CaseOutInner> {
     if family == "harmony" {
         let mut parser = HarmonyToolStreamParser::new()?;
         let mut result = parser.parse_tool_call_streaming_text(text);
@@ -127,7 +131,7 @@ fn parse_result(family: &str, text: &str) -> anyhow::Result<CaseOutInner> {
         });
     }
 
-    let mut parser = create_tool_parser_for_family(family, &[])?;
+    let mut parser = create_tool_parser_for_family(family, tools)?;
     // B9: batch text fed through the shared push_input abstraction (always Text for
     // a complete batch sample) instead of the bare push() call.
     let mut result = parser.push_input(ToolParserInput::Text(text))?;

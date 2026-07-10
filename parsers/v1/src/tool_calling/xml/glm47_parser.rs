@@ -161,6 +161,14 @@ pub fn try_tool_call_parse_glm47(
 }
 
 /// Extract tool calls and normal text from message.
+///
+/// `normal_text` is the model text with each complete tool-call block removed
+/// (from its `<tool_call>` start through its `</tool_call>` end), keeping ALL
+/// other text verbatim: the prefix before the first call, text BETWEEN calls,
+/// and text AFTER the last call. Whitespace is preserved as-is. Only tool-call
+/// markup is stripped — natural text is never dropped and markup never leaks
+/// into normal_text. Malformed / unrecoverable blocks (missing fences, truncated
+/// tails) keep the drop-without-leak behavior.
 fn extract_tool_calls(
     text: &str,
     config: &Glm47ParserConfig,
@@ -203,25 +211,24 @@ fn extract_tool_calls(
         if let Some(start_pos) = text[cursor..].find(start_token.as_str()) {
             let abs_start = cursor + start_pos;
             let gap = &text[cursor..abs_start];
+            // Preserve ALL surrounding natural-language text — the prefix before
+            // the first <tool_call>, text BETWEEN calls, and (in the no-more-calls
+            // arm below) text AFTER the last call. Only tool-call markup is
+            // stripped: recover_bare_glm47_calls_in_span pulls a bare call out of
+            // the gap and keeps its `prefix` prose; orphan_glm47_prefix drops a
+            // stray wire marker but keeps the text before it. The gap text is kept
+            // regardless of whether calls have already been parsed, so inter-call
+            // narration is no longer dropped.
             if let Some((prefix, mut parsed_calls)) =
                 recover_bare_glm47_calls_in_span(gap, config, tools)?
             {
-                if calls.is_empty() {
-                    normal_parts.push(prefix);
-                }
+                normal_parts.push(prefix);
                 calls.append(&mut parsed_calls);
-            } else if calls.is_empty() {
-                if let Some(marker_idx) = first_orphan_glm47_marker_index(gap, config) {
-                    normal_parts.push(orphan_glm47_prefix(gap, marker_idx));
-                } else {
-                    normal_parts.push(gap.to_string());
-                }
+            } else if let Some(marker_idx) = first_orphan_glm47_marker_index(gap, config) {
+                normal_parts.push(orphan_glm47_prefix(gap, marker_idx));
+            } else {
+                normal_parts.push(gap.to_string());
             }
-
-            // Only surface normal text that precedes the first parsed call.
-            // Text after any </tool_call> is not response content; matches the
-            // convention ported into the generic XML parser by PR #9350 and
-            // vLLM's glm47_moe_tool_parser.
 
             // Find the corresponding end token
             if let Some(end_pos) = text[abs_start..].find(end_token.as_str()) {
@@ -300,21 +307,21 @@ fn extract_tool_calls(
                 break;
             }
         } else {
-            // No more tool calls
+            // No more tool calls: this gap is the text AFTER the last </tool_call>
+            // (or the whole message when no call was found). Preserve it verbatim,
+            // stripping only tool-call markup (bare-call recovery keeps its prose
+            // prefix; orphan_glm47_prefix drops a stray wire marker but keeps the
+            // text before it).
             let gap = &text[cursor..];
             if let Some((prefix, mut parsed_calls)) =
                 recover_bare_glm47_calls_in_span(gap, config, tools)?
             {
-                if calls.is_empty() {
-                    normal_parts.push(prefix);
-                }
+                normal_parts.push(prefix);
                 calls.append(&mut parsed_calls);
-            } else if calls.is_empty() {
-                if let Some(marker_idx) = first_orphan_glm47_marker_index(gap, config) {
-                    normal_parts.push(orphan_glm47_prefix(gap, marker_idx));
-                } else {
-                    normal_parts.push(gap.to_string());
-                }
+            } else if let Some(marker_idx) = first_orphan_glm47_marker_index(gap, config) {
+                normal_parts.push(orphan_glm47_prefix(gap, marker_idx));
+            } else {
+                normal_parts.push(gap.to_string());
             }
             break;
         }
@@ -594,11 +601,20 @@ fn parse_tool_call_block(
     let arg_value_start_escaped = regex::escape(&config.arg_value_start);
     let arg_value_end_escaped = regex::escape(&config.arg_value_end);
 
-    // Pattern to match: <arg_key>key</arg_key><arg_value>value</arg_value>
+    // Pattern: <arg_key>key</arg_key><arg_value>value(</arg_value> | end-of-block)
+    // The `</arg_value>` close is treated as OPTIONAL. A final value whose close
+    // tag was dropped (mismatched/missing fences — batch case 4.d
+    // `<arg_value>NYC</tool_call>`, whose trailing `</tool_call>` is stripped
+    // before this regex, leaving the value at end-of-block) is recovered by
+    // terminating at `\z` instead of being dropped to empty args. `</arg_value>`
+    // is listed first so a well-formed value (including a multi-line one) still
+    // terminates exactly there; `\z` only applies when the close tag is absent.
+    // (The `regex` crate has no lookahead, so the terminator is a plain
+    // alternation of the close tag and the end-of-text anchor.)
     // (?s) enables dotall mode so (.*?) matches across newlines — required
     // because models often emit multi-line content in arg values.
     let pattern = format!(
-        r"(?s){}([^<]+){}{}(.*?){}",
+        r"(?s){}([^<]+){}{}(.*?)(?:{}|\z)",
         arg_key_start_escaped, arg_key_end_escaped, arg_value_start_escaped, arg_value_end_escaped
     );
 
@@ -620,12 +636,23 @@ fn parse_tool_call_block(
         }
     }
 
-    // Validate function against tools if provided
-    if let Some(tools_list) = tools {
-        let tool_exists = tools_list.iter().any(|t| t.name == function_name);
-        if !tool_exists {
-            anyhow::bail!("Function '{}' not found in available tools", function_name);
-        }
+    // A tool call for a function not in the request's tools list is still
+    // emitted, not dropped. The parser's job is to extract what the model
+    // produced; validation/rejection belongs to the serving layer. The model
+    // may legitimately reference a tool the caller adds later, or one baked into
+    // its chat template, and dropping it silently hides a real call. This
+    // matches vLLM (which passes the call through) and the other Dynamo parsers
+    // (kimi_k2 / xml / gemma4 already warn-and-pass-through here). We log for
+    // visibility only.
+    if let Some(tools_list) = tools
+        && !tools_list.iter().any(|t| t.name == function_name)
+    {
+        warn!(
+            function = %function_name,
+            why = "tool_not_in_request_tool_list",
+            "GLM-4.7 tool call references a function not in the request's tools list; \
+             passing it through (serving layer validates)"
+        );
     }
 
     Ok(ToolCallResponse {
@@ -900,6 +927,23 @@ mod tests {
         assert_eq!(calls.len(), 0);
     }
 
+    // TOOLCALLING.batch.4.d — missing `</arg_value>` close tag: the value runs
+    // straight into the outer `</tool_call>`. The arg-value close is optional, so
+    // the value is recovered (terminated by the outer close / end-of-block)
+    // instead of being dropped to empty args.
+    #[test] // TOOLCALLING.batch.4
+    fn test_recover_arg_value_missing_close_tag() {
+        let config = get_test_config();
+        let message = "<tool_call>get_weather<arg_key>location</arg_key><arg_value>NYC</tool_call>";
+
+        let (calls, _) = try_tool_call_parse_glm47(message, &config, None).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        let args: HashMap<String, Value> =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args.get("location").unwrap().as_str().unwrap(), "NYC");
+    }
+
     // Recovery for missing outer </tool_call> (max_tokens / EOS truncation):
     // when the inner arg pairs are well-formed, treat EOF as the end token
     // and extract the call. The arg_key opener gates recovery so plain text
@@ -937,9 +981,13 @@ mod tests {
         assert_eq!(calls[1].function.name, "get_time");
     }
 
-    // DEPRECATED(parser-fixture-duplicate): Duplicate of YAML fixture coverage: TOOLCALLING.batch.8.c, TOOLCALLING.batch.13 in tests/parity/toolcalling/fixtures/glm47/TOOLCALLING.batch.13.yaml, tests/parity/toolcalling/fixtures/glm47/TOOLCALLING.batch.8.yaml.
-    #[test] // TOOLCALLING.batch.4, TOOLCALLING.batch.8
-    fn test_unparseable_block_dropped_no_tag_leak() {
+    // TOOLCALLING.batch.13 — a tool call whose function is NOT in the request's
+    // tools list is still emitted (parsing and validation are separate concerns;
+    // the serving layer rejects unknown tools). The wire markup must not leak
+    // into normal_text, and ALL surrounding prose (prefix AND trailing) is
+    // preserved with only the tool-call block removed.
+    #[test] // TOOLCALLING.batch.13
+    fn test_unknown_tool_passes_through_no_tag_leak() {
         let config = get_test_config();
         let tools = vec![ToolDefinition {
             name: "get_weather".to_string(),
@@ -947,26 +995,62 @@ mod tests {
             strict: None,
         }];
 
-        // Tool call block references a function not in the tools list — the
-        // whole block (including <tool_call>...<arg_key>...<arg_value>... wire
-        // markup) must be dropped, not leaked through normal_text.
         let message = "Here is the result: <tool_call>unknown_func<arg_key>x</arg_key><arg_value>1</arg_value></tool_call> done";
         let (calls, normal_text) =
             try_tool_call_parse_glm47(message, &config, Some(&tools)).unwrap();
 
-        assert_eq!(calls.len(), 0);
-        let text = normal_text.unwrap();
-        assert!(
-            !text.contains("unknown_func"),
-            "Unparseable block must be dropped to avoid tag leakage, got: {text}"
+        assert_eq!(
+            calls.len(),
+            1,
+            "unknown tool is passed through, not dropped"
         );
+        assert_eq!(calls[0].function.name, "unknown_func");
+        let text = normal_text.unwrap();
         assert!(
             !text.contains("<tool_call>") && !text.contains("<arg_key>"),
             "Wire-format tags must not leak into normal_text, got: {text}"
         );
-        assert!(
-            text.contains("Here is the result:") && text.contains("done"),
-            "Surrounding prose must be preserved, got: {text}"
+        // The prefix before the call AND the trailing text after </tool_call> are
+        // both kept verbatim; only the tool-call block is removed.
+        assert_eq!(
+            text, "Here is the result:  done",
+            "Prefix and trailing prose must both be preserved, got: {text}"
+        );
+    }
+
+    // Trailing narration after the last </tool_call> is preserved as normal_text
+    // (it used to be dropped). Only the tool-call block is stripped.
+    #[test]
+    fn test_trailing_text_after_tool_call_preserved() {
+        let config = get_test_config();
+        let message = "<tool_call>get_weather<arg_key>location</arg_key><arg_value>NYC</arg_value></tool_call> Let me know if you need more.";
+
+        let (calls, normal_text) = try_tool_call_parse_glm47(message, &config, None).unwrap();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            normal_text,
+            Some(" Let me know if you need more.".to_string()),
+            "Trailing narration after the tool call must be preserved verbatim"
+        );
+    }
+
+    // Narration BETWEEN two tool calls is preserved (it used to be dropped after
+    // the first parsed call). The prefix, the inter-call text, and the trailing
+    // text are all kept; only the two tool-call blocks are removed.
+    #[test]
+    fn test_inter_call_text_preserved() {
+        let config = get_test_config();
+        let message = "I will check the weather. <tool_call>get_weather<arg_key>location</arg_key><arg_value>NYC</arg_value></tool_call> Then check LA weather. <tool_call>get_weather<arg_key>location</arg_key><arg_value>LA</arg_value></tool_call>";
+
+        let (calls, normal_text) = try_tool_call_parse_glm47(message, &config, None).unwrap();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            normal_text,
+            Some("I will check the weather.  Then check LA weather. ".to_string()),
+            "Prefix + inter-call narration must be preserved; only the call blocks are stripped"
         );
     }
 
