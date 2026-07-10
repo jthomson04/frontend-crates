@@ -11,12 +11,21 @@
 //!
 //! The toggle is read once and defaults to off, so the normal path pays no cost.
 
+use std::io::Write;
 use std::sync::OnceLock;
 
 use super::traits::{Result, Tool, ToolParseResult, ToolParser};
 
 /// Env var that turns on `dynamo-parsers-v2` stderr debug output.
 pub const DEBUG_ENV: &str = "DYNAMO_PARSERS_DEBUG";
+
+/// Write one debug line to stderr, discarding any I/O error. Uses fallible
+/// `writeln!` rather than `eprintln!` so debug output can never panic the host
+/// (e.g. when stderr is closed and a write returns `EPIPE`).
+fn emit(args: std::fmt::Arguments<'_>) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "[dynamo-parsers-v2] {args}");
+}
 
 /// Whether debug output is enabled. Read once from the environment.
 pub fn debug_enabled() -> bool {
@@ -37,7 +46,7 @@ pub(super) struct DebugToolParser {
 
 impl DebugToolParser {
     pub(super) fn wrap(family: &str, inner: Box<dyn ToolParser>) -> Box<dyn ToolParser> {
-        eprintln!("[dynamo-parsers-v2] family={family} created");
+        emit(format_args!("family={family} created"));
         Box::new(Self {
             family: family.to_string(),
             inner,
@@ -53,13 +62,13 @@ impl DebugToolParser {
             .iter()
             .filter_map(|c| c.name.as_deref())
             .collect();
-        eprintln!(
-            "[dynamo-parsers-v2] family={} {} emitted {} call update(s) names={:?}",
+        emit(format_args!(
+            "family={} {} emitted {} call update(s) names={:?}",
             self.family,
             method,
             result.calls.len(),
             names
-        );
+        ));
     }
 }
 
