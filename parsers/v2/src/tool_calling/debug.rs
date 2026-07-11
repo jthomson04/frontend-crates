@@ -27,12 +27,24 @@ fn emit(args: std::fmt::Arguments<'_>) {
     let _ = writeln!(stderr, "[dynamo-parsers-v2] {args}");
 }
 
+/// Returns true for the same truthy strings Dynamo uses: "1", "true", "on", "yes"
+/// (case-insensitive). Everything else, including an unset var, is false.
+pub fn is_truthy(val: &str) -> bool {
+    matches!(val.to_lowercase().as_str(), "1" | "true" | "on" | "yes")
+}
+
+/// Returns true if the named environment variable is set to a truthy value.
+pub fn env_is_truthy(env: &str) -> bool {
+    match std::env::var(env) {
+        Ok(val) => is_truthy(val.as_str()),
+        Err(_) => false,
+    }
+}
+
 /// Whether debug output is enabled. Read once from the environment.
 pub fn debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var(DEBUG_ENV).is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "True" | "TRUE"))
-    })
+    *ENABLED.get_or_init(|| env_is_truthy(DEBUG_ENV))
 }
 
 /// Wraps a family stream parser and logs creation plus emitted tool calls to
